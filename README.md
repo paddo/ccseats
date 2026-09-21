@@ -9,7 +9,7 @@ seat  tier  email              5h   7d  fable  5h reset   7d reset   live  note
 ───────────────────────────────────────────────────────────────────────────────
 main     1  you@example.com    7%  39%    54%  Tue 04:30  Fri 18:00     3
 work     1  work@example.com   0%  62%    92%  -          Thu 10:00     0
-bot      2  bot@example.com    0%   0%     0%  -          Sun 15:00     1
+spare    2  spare@example.com  0%   0%     0%  -          Sun 15:00     0
 ```
 
 One zsh script. On macOS it needs only what the system ships. On Linux it needs `zsh`, `jq` and `curl`.
@@ -96,7 +96,7 @@ Rules:
 2. Inside a tier: most headroom on the protected model, then most 5-hour headroom, then fewest live sessions.
 3. A seat is skipped when it is locked, when its 5-hour or model usage is over the thresholds, or when its weekly usage is over its own `maxWeekly`.
 
-`tier` and `maxWeekly` exist for an account you want to keep in reserve, for example one that also runs a scheduled job.
+`tier` and `maxWeekly` exist for a lower priority account: one you want used last, and never run down past a set share of its week.
 
 ## Config
 
@@ -107,7 +107,7 @@ Rules:
   "seats": {
     "main": { "dir": "~/.claude", "chrome": "Default", "tier": 1 },
     "work": { "dir": "~/.claude-work", "chrome": "Profile 1", "tier": 1 },
-    "bot":  { "dir": "~/.claude-bot", "chrome": "Profile 2", "tier": 2, "maxWeekly": 70 }
+    "spare": { "dir": "~/.claude-spare", "chrome": "Profile 2", "tier": 2, "maxWeekly": 70 }
   },
   "model": "Fable",
   "autoPick": false,
