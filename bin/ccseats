@@ -1,0 +1,322 @@
+#!/bin/zsh
+# ccseats: run several Claude Code accounts ("seats") side by side on macOS and Linux.
+# Each seat is a CLAUDE_CONFIG_DIR. Claude Code keys its login to that directory (a Keychain item
+# on macOS, .credentials.json inside the directory on Linux), so seats stay signed in
+# independently while sharing plugins, skills, settings and transcripts.
+emulate -L zsh
+setopt pipe_fail extended_glob
+
+VERSION=0.1.0
+CONFIG=${CCSEATS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ccseats/config.json}
+DEFAULT_DIR=$HOME/.claude
+USAGE_URL=https://api.anthropic.com/api/oauth/usage
+# The usage endpoint answers 429 with a multi-minute retry-after when polled often, so every
+# command reads the per-seat cache and at most one request per seat goes out per TTL.
+CACHE_TTL=120
+
+# Linked from the default config dir into every other seat. Everything else stays per seat:
+# .claude.json (account, Chrome pairing), history.jsonl (Claude Code refuses a linked history
+# file), sessions, session-env, security state, telemetry, caches.
+SHARED_DIRS=(projects plugins skills commands agents hooks output-styles scripts file-history plans paste-cache backups downloads uploads teams tasks feedback chrome)
+SHARED_FILES=(CLAUDE.md settings.json settings.local.json keybindings.json)
+
+die() { print -u2 "ccseats: $*"; exit 1 }
+need_config() { [[ -f $CONFIG ]] || die "no config at $CONFIG. Run: ccseats init" }
+cfg() { jq -r "$@" $CONFIG }
+seats() { cfg '.seats | keys_unsorted[]' }
+has_seat() { [[ -f $CONFIG ]] && jq -e --arg n "$1" '.seats[$n]' $CONFIG >/dev/null 2>&1 }
+seat_dir() { local d=$(cfg --arg n "$1" '.seats[$n].dir'); print -r -- ${d/#\~/$HOME} }
+# The default seat keeps its global config beside the directory; other seats keep it inside.
+global_config() { [[ $1 == $DEFAULT_DIR ]] && print -r -- $HOME/.claude.json || print -r -- $1/.claude.json }
+
+if [[ $OSTYPE == darwin* ]]; then
+  mtime() { stat -f %m $1 }
+  clock() { date -r $1 "+%a %H:%M" }
+else
+  mtime() { stat -c %Y $1 }
+  clock() { date -d @$1 "+%a %H:%M" }
+fi
+
+# Claude Code names the Keychain item "Claude Code-credentials", and appends the first 8 hex
+# characters of sha256(config dir) when CLAUDE_CONFIG_DIR is set.
+keychain_service() {
+  [[ $1 == $DEFAULT_DIR ]] && { print -r -- "Claude Code-credentials"; return }
+  print -r -- "Claude Code-credentials-$(printf %s "$1" | shasum -a 256 | cut -c1-8)"
+}
+
+# Prints the seat's stored login JSON, or nothing when the seat has none.
+credentials() {
+  if [[ $OSTYPE == darwin* ]]; then
+    security find-generic-password -a "$USER" -s "$(keychain_service $1)" -w 2>/dev/null
+  else
+    cat $1/.credentials.json 2>/dev/null
+  fi
+}
+
+# Refreshes <dir>/usage-cache.json when it is older than CACHE_TTL. A failure leaves the old cache
+# in place and writes the reason to <dir>/usage-cache.note. A 429 sets a backoff until retry-after.
+fetch_usage() {
+  local dir=$1 cache=$1/usage-cache.json note=$1/usage-cache.note retry=$1/usage-cache.retry creds tok expires code now=$(date +%s)
+  [[ -f $cache ]] && (( now - $(mtime $cache) < CACHE_TTL )) && { rm -f $note; return 0 }
+  [[ -f $retry ]] && (( now < $(<$retry) )) && return 1
+  rm -f $note $retry
+  creds=$(credentials $dir)
+  if [[ -z $creds ]]; then
+    if jq -e '.oauthAccount' "$(global_config $dir)" >/dev/null 2>&1; then
+      print "signed in, but no stored login where ccseats expects it" > $note
+    else
+      print "not logged in" > $note
+    fi
+    rm -f $cache; return 1
+  fi
+  tok=$(jq -r '.claudeAiOauth.accessToken // empty' <<< $creds)
+  expires=$(jq -r '.claudeAiOauth.expiresAt // 0' <<< $creds)
+  if (( expires < now * 1000 )); then
+    print "login idle, showing cached usage" > $note; return 1
+  fi
+  code=$(curl -s -m 8 -D $cache.hdr -o $cache.tmp -w '%{http_code}' -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" $USAGE_URL)
+  if [[ $code == 429 ]]; then
+    local wait=$(awk 'tolower($1) == "retry-after:" { print int($2) }' $cache.hdr)
+    print $(( now + ${wait:-300} )) > $retry
+    print "rate limited, showing cached usage" > $note
+  elif [[ $code != 200 ]]; then
+    print "usage request failed (HTTP $code)" > $note
+  elif ! jq -e '.limits | type == "array"' $cache.tmp >/dev/null 2>&1; then
+    print "usage payload changed shape, update ccseats" > $note
+  else
+    mv $cache.tmp $cache
+  fi
+  rm -f $cache.tmp $cache.hdr
+  [[ ! -f $note ]]
+}
+
+refresh_all() {
+  local n
+  for n in $(seats); do fetch_usage "$(seat_dir $n)" & done
+  wait
+}
+
+live_sessions() {
+  local f pid n=0
+  for f in $1/sessions/*.json(N); do
+    pid=$(jq -r '.pid // empty' $f 2>/dev/null)
+    [[ -n $pid ]] && kill -0 $pid 2>/dev/null && (( n++ ))
+  done
+  print $n
+}
+
+# One line per seat, fields split by the ASCII unit separator so empty fields survive `read`:
+# name tier email session weekly model resetSession resetWeekly live maxWeekly note
+SEP=$'\x1f'
+rows() {
+  local model=$(cfg '.model // "Fable"') n dir cache
+  for n in $(seats); do
+    dir=$(seat_dir $n); cache=$dir/usage-cache.json
+    local email=$(jq -r '.oauthAccount.emailAddress // "-"' "$(global_config $dir)" 2>/dev/null)
+    local tier=$(cfg --arg n $n '.seats[$n].tier // 1') maxw=$(cfg --arg n $n '.seats[$n].maxWeekly // ""')
+    local usage="$SEP$SEP$SEP$SEP" note=""
+    if [[ -f $cache ]]; then
+      # An idle seat cannot use more quota, so a cached value stays a safe upper bound, and a
+      # window whose reset time has passed counts as empty.
+      usage=$(jq -r --arg m "$model" --argjson now $(date +%s) '
+        def epoch: if . == null then null else (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601) end;
+        def lim(f): [.limits[] | select(f)][0];
+        def used: if . == null then "" elif ((.resets_at | epoch) // $now) < $now then 0 else .percent end;
+        def reset: if . == null then "" else ((.resets_at | epoch) as $e | if $e == null or $e < $now then "" else $e end) end;
+        lim(.kind == "session") as $s | lim(.kind == "weekly_all") as $w
+        | lim(.kind == "weekly_scoped" and .scope.model.display_name == $m) as $x
+        | [($s | used), ($w | used), ($x | used), ($s | reset), ($w | reset)] | map(tostring) | join("\u001f")' $cache)
+      note=$(jq -r '[.five_hour.locked_reason, .seven_day.locked_reason] | map(select(. != null)) | first // "" | if . != "" then "locked: \(.)" else "" end' $cache)
+    fi
+    [[ -f $dir/usage-cache.note ]] && note=$(<$dir/usage-cache.note)
+    print -r -- "$n$SEP$tier$SEP${email:--}$SEP$usage$SEP$(live_sessions $dir)$SEP$maxw$SEP$note"
+  done
+}
+
+# Lowest tier first. Inside a tier the seat with the most model headroom wins, then 5h headroom,
+# then fewest live sessions. A seat over a threshold, or over its own maxWeekly, is skipped.
+pick() {
+  local ts=$(cfg '.thresholds.session // 90') tm=$(cfg '.thresholds.model // 85')
+  rows | awk -F$SEP -v ts=$ts -v tm=$tm '
+    { known = ($4 != ""); ok = known && $11 !~ /^locked/ && $4 < ts && ($6 == "" ? 0 : $6) < tm && ($10 == "" || $5 < $10)
+      if (ok) printf "%d\t%09.3f\t%09.3f\t%05d\t%s\n", $2, ($6 == "" ? 0 : $6), $4, $9, $1
+      if (known && (best == "" || $4 < bests)) { best = $1; bests = $4 }
+      if (first == "") first = $1 }
+    END { print "9999999\t\t\t\t" (best != "" ? best : first) }' | LC_ALL=C sort -n | head -1 | cut -f5
+}
+
+colours() {
+  if [[ $1 == on ]]; then
+    C_RESET=$'\e[0m' C_DIM=$'\e[2m' C_BOLD=$'\e[1m' C_GREEN=$'\e[32m' C_YELLOW=$'\e[33m' C_RED=$'\e[31m' C_MAGENTA=$'\e[35m' C_CYAN=$'\e[36m'
+  else
+    C_RESET= C_DIM= C_BOLD= C_GREEN= C_YELLOW= C_RED= C_MAGENTA= C_CYAN=
+  fi
+}
+# The table goes to stdout for status and to stderr when a seat name is the real output.
+colours_for() { [[ -t $1 ]] && colours on || colours off }
+used_colour() { (( ${1%.*} < 50 )) && print -r -- $C_GREEN || { (( ${1%.*} < 80 )) && print -r -- $C_YELLOW || print -r -- $C_RED } }
+when() { [[ -n $1 ]] && clock ${1%.*} || print -- - }
+
+table() {
+  local chosen=${1:-} model=$(cfg '.model // "Fable"' | tr '[:upper:]' '[:lower:]')
+  local -a head=(seat tier email 5h 7d $model "5h reset" "7d reset" live note) right=(0 1 0 1 1 1 0 0 1 0)
+  local -a cells colours widths row col
+  local line i r text padded n tier email s w m rs rw live maxw note
+  for i in {1..10}; do widths[i]=${#head[i]}; done
+  while IFS=$SEP read -r n tier email s w m rs rw live maxw note; do
+    row=("$n" "$tier" "$email" "${s:+${s%.*}%}" "${w:+${w%.*}%}" "${m:+${m%.*}%}" "$(when "$rs")" "$(when "$rw")" "$live" "$note")
+    col=("$C_BOLD$C_MAGENTA" "$C_DIM" "" "${s:+$(used_colour $s)}" "${w:+$(used_colour $w)}" "${m:+$(used_colour $m)}" "$C_DIM" "$C_DIM" "" "$C_YELLOW")
+    [[ -z $s ]] && row[4]=- row[5]=- row[6]=-
+    [[ -n $s && -z $m ]] && row[6]=0% col[6]=$C_GREEN
+    for i in {1..10}; do (( ${#row[i]} > widths[i] )) && widths[i]=${#row[i]}; done
+    cells+=("${row[@]}"); colours+=("${col[@]}")
+  done < <(rows)
+  local mark="" ; [[ -n $chosen ]] && mark="    "
+  line=$mark
+  for i in {1..10}; do (( right[i] )) && line+="${(l:widths[i]:)head[i]}  " || line+="${(r:widths[i]:)head[i]}  "; done
+  print -r -- "$C_DIM${line%% #}$C_RESET"
+  print -r -- "$C_DIM${(l:${#${line%% #}}::─:)}$C_RESET"
+  for (( r = 0; r < ${#cells} / 10; r++ )); do
+    line=""
+    [[ -n $chosen ]] && { [[ ${cells[r*10+1]} == $chosen ]] && line="$C_CYAN->$C_RESET  " || line="    " }
+    for i in {1..10}; do
+      text=${cells[r*10+i]}
+      (( right[i] )) && padded=${(l:widths[i]:)text} || padded=${(r:widths[i]:)text}
+      line+="${colours[r*10+i]}$padded$C_RESET  "
+    done
+    print -r -- "${line%% #}"
+  done
+}
+
+link_shared() {
+  local dir=$1 item
+  mkdir -p $dir/security
+  for item in $SHARED_DIRS $SHARED_FILES; do
+    [[ -e $DEFAULT_DIR/$item ]] && ln -sfn $DEFAULT_DIR/$item $dir/$item
+  done
+  [[ -d $DEFAULT_DIR/security/agent-sdk-venv ]] && ln -sfn $DEFAULT_DIR/security/agent-sdk-venv $dir/security/agent-sdk-venv
+  # Carry over per-project trust and tool approvals so a new seat does not re-prompt for every repo.
+  if [[ ! -e $dir/.claude.json && -f $HOME/.claude.json ]]; then
+    jq '{projects, hasCompletedOnboarding, lastOnboardingVersion} | with_entries(select(.value != null))' $HOME/.claude.json > $dir/.claude.json
+    chmod 600 $dir/.claude.json
+  fi
+}
+
+cmd_init() {
+  [[ -f $CONFIG ]] && die "$CONFIG already exists"
+  mkdir -p ${CONFIG:h}
+  jq -n '{seats: {main: {dir: "~/.claude", chrome: "Default", tier: 1}}, model: "Fable", autoPick: false, thresholds: {session: 90, model: 85}}' > $CONFIG
+  print "created $CONFIG with seat \"main\" on ~/.claude. Add more with: ccseats add <name>"
+}
+
+cmd_add() {
+  local name=${1:-} chrome="" tier=1 maxw=""
+  [[ $name =~ '^[a-z0-9][a-z0-9_-]*$' ]] || die "usage: ccseats add <name> [--chrome \"Profile 1\"] [--tier N] [--max-weekly N]"
+  shift
+  while (( $# )); do
+    case $1 in
+      --chrome) chrome=$2; shift 2 ;;
+      --tier) tier=$2; shift 2 ;;
+      --max-weekly) maxw=$2; shift 2 ;;
+      *) die "unknown option $1" ;;
+    esac
+  done
+  [[ -f $CONFIG ]] || cmd_init
+  has_seat $name && die "seat $name already exists"
+  local dir=$HOME/.claude-$name
+  link_shared $dir
+  jq --arg n $name --arg c "$chrome" --argjson t $tier --arg m "$maxw" \
+    '.seats[$n] = ({dir: "~/.claude-\($n)", tier: $t} + (if $c != "" then {chrome: $c} else {} end) + (if $m != "" then {maxWeekly: ($m | tonumber)} else {} end))' \
+    $CONFIG > $CONFIG.tmp && mv $CONFIG.tmp $CONFIG
+  print "seat $name ready at $dir. Next: ccseats $name, then /login with that account."
+}
+
+cmd_relink() { need_config; local n d; for n in $(seats); do d=$(seat_dir $n); [[ $d == $DEFAULT_DIR ]] || { link_shared $d; print "relinked $n" } done }
+
+cmd_chrome() {
+  need_config; has_seat ${1:-} || die "usage: ccseats chrome <seat>"
+  local profile=$(cfg --arg n $1 '.seats[$n].chrome // empty')
+  [[ -n $profile ]] || die "seat $1 has no chrome profile in $CONFIG"
+  if [[ $OSTYPE == darwin* ]]; then
+    open -na "Google Chrome" --args --profile-directory=$profile
+  else
+    local chrome=${commands[google-chrome]:-${commands[google-chrome-stable]:-${commands[chromium]:-}}}
+    [[ -n $chrome ]] || die "no google-chrome or chromium on PATH"
+    $chrome --profile-directory=$profile >/dev/null 2>&1 &!
+  fi
+}
+
+# Segment for a Claude Code statusline script: seat name plus remaining 5h and model budget.
+# Never waits on the network: a stale cache triggers a background refresh and the old values show.
+cmd_statusline() {
+  need_config
+  local dir=${CLAUDE_CONFIG_DIR:-$DEFAULT_DIR} n name="" cache
+  for n in $(seats); do [[ $(seat_dir $n) == $dir ]] && name=$n; done
+  [[ -n $name ]] || name=${dir:t}
+  cache=$dir/usage-cache.json
+  if ! [[ -e $cache.lock ]]; then
+    ( touch $cache.lock; fetch_usage $dir; rm -f $cache.lock ) >/dev/null 2>&1 &!
+  fi
+  local model=$(cfg '.model // "Fable"') s m out
+  if [[ -f $cache ]]; then
+    s=$(jq -r '[.limits[] | select(.kind == "session")][0].percent // empty' $cache)
+    m=$(jq -r --arg m "$model" '[.limits[] | select(.kind == "weekly_scoped" and .scope.model.display_name == $m)][0].percent // 0' $cache)
+  fi
+  out="$C_MAGENTA$name$C_RESET"
+  if [[ -n $s ]]; then
+    local part v left
+    for part in "5h:$s" "${model:l}:$m"; do
+      v=${part#*:}; left=$(( 100 - ${v%.*} ))
+      out+=" ${part%%:*} $( (( left >= 50 )) && print -rn -- $C_GREEN || { (( left >= 20 )) && print -rn -- $C_YELLOW || print -rn -- $C_RED } )$left%$C_RESET"
+    done
+    out+="$C_DIM left$C_RESET"
+  fi
+  print -rn -- $out
+}
+
+run_seat() {
+  local dir=$(seat_dir $1); shift
+  [[ -d $dir ]] || die "$dir does not exist. Run: ccseats relink"
+  if [[ $dir == $DEFAULT_DIR ]]; then exec env -u CLAUDE_CONFIG_DIR claude "$@"; fi
+  CLAUDE_CONFIG_DIR=$dir exec claude "$@"
+}
+
+usage() {
+  cat <<EOF
+ccseats $VERSION - several Claude Code accounts side by side
+
+  ccseats init                         create the config with seat "main" on ~/.claude
+  ccseats add <name> [--chrome "Profile 1"] [--tier N] [--max-weekly N]
+  ccseats status                       usage table for every seat (alias: usage)
+  ccseats pick                         show the table and the seat the picker would choose
+  ccseats <seat> [claude args]         run claude on that seat
+  ccseats [claude args]                run claude on the picked seat if autoPick is on, else the first seat
+  ccseats chrome <seat>                open the Chrome profile mapped to that seat
+  ccseats statusline                   seat name and remaining budget, for a statusline script
+  ccseats relink                       recreate the shared symlinks in every seat
+
+Config: $CONFIG
+EOF
+}
+
+[[ $OSTYPE == (darwin|linux)* ]] || die "macOS and Linux only (WSL counts as Linux)"
+command -v jq >/dev/null || die "jq is required (macOS 15 and later ships it; otherwise brew, apt or dnf install jq)"
+
+case ${1:-} in
+  -h|--help|help) usage ;;
+  -v|--version) print $VERSION ;;
+  init) cmd_init ;;
+  add) shift; cmd_add "$@" ;;
+  relink) cmd_relink ;;
+  status|usage) need_config; colours_for 1; refresh_all; table ;;
+  pick) need_config; colours_for 2; refresh_all; chosen=$(pick); table $chosen >&2; print -r -- $chosen ;;
+  chrome) shift; cmd_chrome "$@" ;;
+  statusline) colours on; cmd_statusline ;;
+  *)
+    need_config
+    if has_seat ${1:-}; then seat=$1; shift
+    elif [[ $(cfg '.autoPick // false') == true ]]; then colours_for 2; refresh_all; seat=$(pick); table $seat >&2
+    else seat=$(seats | head -1)
+    fi
+    run_seat $seat "$@" ;;
+esac
