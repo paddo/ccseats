@@ -56,7 +56,7 @@ credentials() {
 # Refreshes <dir>/usage-cache.json when it is older than CACHE_TTL. A failure leaves the old cache
 # in place and writes the reason to <dir>/usage-cache.note. A 429 sets a backoff until retry-after.
 fetch_usage() {
-  local dir=$1 cache=$1/usage-cache.json note=$1/usage-cache.note retry=$1/usage-cache.retry creds tok expires code now=$(date +%s)
+  local dir=$1 cache=$1/usage-cache.json note=$1/usage-cache.note retry=$1/usage-cache.retry tmp=$1/usage-cache.$$ creds tok expires code now=$(date +%s)
   [[ -f $cache ]] && (( now - $(mtime $cache) < CACHE_TTL )) && { rm -f $note; return 0 }
   [[ -f $retry ]] && (( now < $(<$retry) )) && return 1
   rm -f $note $retry
@@ -74,19 +74,19 @@ fetch_usage() {
   if (( expires < now * 1000 )); then
     print "login idle, showing cached usage" > $note; return 1
   fi
-  code=$(curl -s -m 8 -D $cache.hdr -o $cache.tmp -w '%{http_code}' -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" $USAGE_URL)
+  code=$(curl -s -m 8 -D $tmp.hdr -o $tmp -w '%{http_code}' -H "Authorization: Bearer $tok" -H "anthropic-beta: oauth-2025-04-20" $USAGE_URL)
   if [[ $code == 429 ]]; then
-    local wait=$(awk 'tolower($1) == "retry-after:" { print int($2) }' $cache.hdr)
+    local wait=$(awk 'tolower($1) == "retry-after:" { print int($2) }' $tmp.hdr)
     print $(( now + ${wait:-300} )) > $retry
     print "rate limited, showing cached usage" > $note
   elif [[ $code != 200 ]]; then
     print "usage request failed (HTTP $code)" > $note
-  elif ! jq -e '.limits | type == "array"' $cache.tmp >/dev/null 2>&1; then
+  elif ! jq -e '.limits | type == "array"' $tmp >/dev/null 2>&1; then
     print "usage payload changed shape, update ccseats" > $note
   else
-    mv $cache.tmp $cache
+    mv $tmp $cache
   fi
-  rm -f $cache.tmp $cache.hdr
+  rm -f $tmp $tmp.hdr
   [[ ! -f $note ]]
 }
 
@@ -105,44 +105,50 @@ live_sessions() {
   print $n
 }
 
-# One line per seat, fields split by the ASCII unit separator so empty fields survive `read`:
-# name tier email session weekly model resetSession resetWeekly live maxWeekly note
 SEP=$'\x1f'
+# session weekly model resetSession resetWeekly, split by the ASCII unit separator so empty fields
+# survive `read`. An idle seat cannot use more quota, so a cached value stays a safe upper bound,
+# and a window whose reset time has passed counts as empty.
+usage_fields() {
+  jq -r --arg m "$(cfg '.model // "Fable"')" --argjson now $(date +%s) '
+    def epoch: if . == null then null else (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601) end;
+    def lim(f): [.limits[] | select(f)][0];
+    def used: if . == null then "" elif ((.resets_at | epoch) // $now) < $now then 0 else .percent end;
+    def reset: if . == null then "" else ((.resets_at | epoch) as $e | if $e == null or $e < $now then "" else $e end) end;
+    lim(.kind == "session") as $s | lim(.kind == "weekly_all") as $w
+    | lim(.kind == "weekly_scoped" and .scope.model.display_name == $m) as $x
+    | [($s | used), ($w | used), ($x | used), ($s | reset), ($w | reset)] | map(tostring) | join("\u001f")' $1
+}
+
+# One line per seat: name tier email session weekly model resetSession resetWeekly live maxWeekly note
 rows() {
-  local model=$(cfg '.model // "Fable"') n dir cache
+  local n dir cache
   for n in $(seats); do
     dir=$(seat_dir $n); cache=$dir/usage-cache.json
     local email=$(jq -r '.oauthAccount.emailAddress // "-"' "$(global_config $dir)" 2>/dev/null)
     local tier=$(cfg --arg n $n '.seats[$n].tier // 1') maxw=$(cfg --arg n $n '.seats[$n].maxWeekly // ""')
     local usage="$SEP$SEP$SEP$SEP" note=""
     if [[ -f $cache ]]; then
-      # An idle seat cannot use more quota, so a cached value stays a safe upper bound, and a
-      # window whose reset time has passed counts as empty.
-      usage=$(jq -r --arg m "$model" --argjson now $(date +%s) '
-        def epoch: if . == null then null else (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601) end;
-        def lim(f): [.limits[] | select(f)][0];
-        def used: if . == null then "" elif ((.resets_at | epoch) // $now) < $now then 0 else .percent end;
-        def reset: if . == null then "" else ((.resets_at | epoch) as $e | if $e == null or $e < $now then "" else $e end) end;
-        lim(.kind == "session") as $s | lim(.kind == "weekly_all") as $w
-        | lim(.kind == "weekly_scoped" and .scope.model.display_name == $m) as $x
-        | [($s | used), ($w | used), ($x | used), ($s | reset), ($w | reset)] | map(tostring) | join("\u001f")' $cache)
+      usage=$(usage_fields $cache)
       note=$(jq -r '[.five_hour.locked_reason, .seven_day.locked_reason] | map(select(. != null)) | first // "" | if . != "" then "locked: \(.)" else "" end' $cache)
     fi
-    [[ -f $dir/usage-cache.note ]] && note=$(<$dir/usage-cache.note)
+    # The lock must stay visible to the picker, so a fetch note is appended rather than substituted.
+    [[ -f $dir/usage-cache.note ]] && note="${note:+$note; }$(<$dir/usage-cache.note)"
     print -r -- "$n$SEP$tier$SEP${email:--}$SEP$usage$SEP$(live_sessions $dir)$SEP$maxw$SEP$note"
   done
 }
 
 # Lowest tier first. Inside a tier the seat with the most model headroom wins, then 5h headroom,
-# then fewest live sessions. A seat over a threshold, or over its own maxWeekly, is skipped.
+# then fewest live sessions. A seat over a threshold, or over its own maxWeekly, is skipped. When
+# every seat is over a threshold the least used one is picked, but a locked or capped seat never is.
 pick() {
   local ts=$(cfg '.thresholds.session // 90') tm=$(cfg '.thresholds.model // 85')
   rows | awk -F$SEP -v ts=$ts -v tm=$tm '
-    { known = ($4 != ""); ok = known && $11 !~ /^locked/ && $4 < ts && ($6 == "" ? 0 : $6) < tm && ($10 == "" || $5 < $10)
+    { known = ($4 != ""); usable = known && $11 !~ /^locked/ && ($10 == "" || $5 < $10)
+      ok = usable && $4 < ts && ($6 == "" ? 0 : $6) < tm
       if (ok) printf "%d\t%09.3f\t%09.3f\t%05d\t%s\n", $2, ($6 == "" ? 0 : $6), $4, $9, $1
-      if (known && (best == "" || $4 < bests)) { best = $1; bests = $4 }
-      if (first == "") first = $1 }
-    END { print "9999999\t\t\t\t" (best != "" ? best : first) }' | LC_ALL=C sort -n | head -1 | cut -f5
+      if (usable && (best == "" || $4 < bests)) { best = $1; bests = $4 } }
+    END { if (best != "") print "9999999\t\t\t\t" best }' | LC_ALL=C sort -n | head -1 | cut -f5
 }
 
 colours() {
@@ -188,13 +194,23 @@ table() {
   done
 }
 
+# ln -sfn would place the link inside a real directory of the same name, so a seat that already has
+# its own copy is reported instead of linked.
+link_item() {
+  if [[ -e $2 && ! -L $2 ]]; then
+    print -u2 "ccseats: $2 is not a link and was left alone. Merge it into $1, remove it, then: ccseats relink"
+    return
+  fi
+  ln -sfn $1 $2
+}
+
 link_shared() {
   local dir=$1 item
   mkdir -p $dir/security
   for item in $SHARED_DIRS $SHARED_FILES; do
-    [[ -e $DEFAULT_DIR/$item ]] && ln -sfn $DEFAULT_DIR/$item $dir/$item
+    [[ -e $DEFAULT_DIR/$item ]] && link_item $DEFAULT_DIR/$item $dir/$item
   done
-  [[ -d $DEFAULT_DIR/security/agent-sdk-venv ]] && ln -sfn $DEFAULT_DIR/security/agent-sdk-venv $dir/security/agent-sdk-venv
+  [[ -d $DEFAULT_DIR/security/agent-sdk-venv ]] && link_item $DEFAULT_DIR/security/agent-sdk-venv $dir/security/agent-sdk-venv
   # Carry over per-project trust and tool approvals so a new seat does not re-prompt for every repo.
   if [[ ! -e $dir/.claude.json && -f $HOME/.claude.json ]]; then
     jq '{projects, hasCompletedOnboarding, lastOnboardingVersion} | with_entries(select(.value != null))' $HOME/.claude.json > $dir/.claude.json
@@ -212,14 +228,17 @@ cmd_init() {
 cmd_add() {
   local name=${1:-} chrome="" tier=1 maxw=""
   [[ $name =~ '^[a-z0-9][a-z0-9_-]*$' ]] || die "usage: ccseats add <name> [--chrome \"Profile 1\"] [--tier N] [--max-weekly N]"
+  [[ $name == (help|init|add|relink|status|usage|pick|chrome|statusline) ]] && die "$name is a ccseats command, choose another seat name"
   shift
   while (( $# )); do
+    (( $# >= 2 )) || die "$1 needs a value"
     case $1 in
-      --chrome) chrome=$2; shift 2 ;;
-      --tier) tier=$2; shift 2 ;;
-      --max-weekly) maxw=$2; shift 2 ;;
+      --chrome) chrome=$2 ;;
+      --tier) [[ $2 == <1-> ]] || die "--tier needs a whole number"; tier=$2 ;;
+      --max-weekly) [[ $2 == <0-100> ]] || die "--max-weekly needs 0 to 100"; maxw=$2 ;;
       *) die "unknown option $1" ;;
     esac
+    shift 2
   done
   [[ -f $CONFIG ]] || cmd_init
   has_seat $name && die "seat $name already exists"
@@ -254,14 +273,13 @@ cmd_statusline() {
   for n in $(seats); do [[ $(seat_dir $n) == $dir ]] && name=$n; done
   [[ -n $name ]] || name=${dir:t}
   cache=$dir/usage-cache.json
-  if ! [[ -e $cache.lock ]]; then
+  # curl gives up after 8s, so a lock older than 30s belongs to a fetch that was killed.
+  if ! [[ -e $cache.lock ]] || (( $(date +%s) - $(mtime $cache.lock) > 30 )); then
     ( touch $cache.lock; fetch_usage $dir; rm -f $cache.lock ) >/dev/null 2>&1 &!
   fi
-  local model=$(cfg '.model // "Fable"') s m out
-  if [[ -f $cache ]]; then
-    s=$(jq -r '[.limits[] | select(.kind == "session")][0].percent // empty' $cache)
-    m=$(jq -r --arg m "$model" '[.limits[] | select(.kind == "weekly_scoped" and .scope.model.display_name == $m)][0].percent // 0' $cache)
-  fi
+  local model=$(cfg '.model // "Fable"') s w m rs rw out
+  [[ -f $cache ]] && IFS=$SEP read -r s w m rs rw <<< "$(usage_fields $cache)"
+  m=${m:-0}
   out="$C_MAGENTA$name$C_RESET"
   if [[ -n $s ]]; then
     local part v left
@@ -274,11 +292,13 @@ cmd_statusline() {
   print -rn -- $out
 }
 
+# Claude Code prefers a token or API key from the environment over the stored login, which would
+# silently run every seat on the same account, so those are dropped.
 run_seat() {
   local dir=$(seat_dir $1); shift
   [[ -d $dir ]] || die "$dir does not exist. Run: ccseats relink"
-  if [[ $dir == $DEFAULT_DIR ]]; then exec env -u CLAUDE_CONFIG_DIR claude "$@"; fi
-  CLAUDE_CONFIG_DIR=$dir exec claude "$@"
+  if [[ $dir == $DEFAULT_DIR ]]; then exec env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY claude "$@"; fi
+  exec env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR=$dir claude "$@"
 }
 
 usage() {
@@ -309,13 +329,15 @@ case ${1:-} in
   add) shift; cmd_add "$@" ;;
   relink) cmd_relink ;;
   status|usage) need_config; colours_for 1; refresh_all; table ;;
-  pick) need_config; colours_for 2; refresh_all; chosen=$(pick); table $chosen >&2; print -r -- $chosen ;;
+  pick) need_config; colours_for 2; refresh_all; chosen=$(pick); table $chosen >&2; [[ -n $chosen ]] || die "every seat is locked or over its weekly cap"; print -r -- $chosen ;;
   chrome) shift; cmd_chrome "$@" ;;
   statusline) colours on; cmd_statusline ;;
   *)
     need_config
     if has_seat ${1:-}; then seat=$1; shift
-    elif [[ $(cfg '.autoPick // false') == true ]]; then colours_for 2; refresh_all; seat=$(pick); table $seat >&2
+    elif [[ $(cfg '.autoPick // false') == true ]]; then
+      colours_for 2; refresh_all; seat=$(pick); table $seat >&2
+      [[ -n $seat ]] || die "every seat is locked or over its weekly cap"
     else seat=$(seats | head -1)
     fi
     run_seat $seat "$@" ;;
