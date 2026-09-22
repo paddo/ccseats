@@ -228,7 +228,7 @@ cmd_init() {
 cmd_add() {
   local name=${1:-} chrome="" tier=1 maxw=""
   [[ $name =~ '^[a-z0-9][a-z0-9_-]*$' ]] || die "usage: ccseats add <name> [--chrome \"Profile 1\"] [--tier N] [--max-weekly N]"
-  [[ $name == (help|init|add|remove|relink|status|usage|pick|chrome|statusline) ]] && die "$name is a ccseats command, choose another seat name"
+  [[ $name == (help|init|add|remove|relink|status|usage|pick|chrome|pair|statusline) ]] && die "$name is a ccseats command, choose another seat name"
   shift
   while (( $# )); do
     (( $# >= 2 )) || die "$1 needs a value"
@@ -312,11 +312,34 @@ cmd_statusline() {
   print -rn -- $out
 }
 
+# Claude Code reads the paired browser from chromeExtension in the seat's global config, so a pinned
+# device is written there before every launch. The label is the seat name, which is unique.
+pin_device() {
+  local name=$1 dir=$2 device=$(cfg --arg n $1 '.seats[$n].device // empty') gc
+  [[ -n $device ]] || return 0
+  gc=$(global_config $dir)
+  [[ -f $gc ]] || print '{}' > $gc
+  jq -e --arg d $device --arg n $name '.chromeExtension.pairedDeviceId == $d and .chromeExtension.pairedDeviceName == $n' $gc >/dev/null 2>&1 && return 0
+  jq --arg d $device --arg n $name '.chromeExtension = {pairedDeviceId: $d, pairedDeviceName: $n}' $gc > $gc.tmp && chmod 600 $gc.tmp && mv $gc.tmp $gc
+}
+
+# Saves the browser a seat is currently paired with, so every later launch uses that one.
+cmd_pair() {
+  local name=${1:-}
+  has_seat $name || die "usage: ccseats pair <seat>"
+  local device=$(jq -r '.chromeExtension.pairedDeviceId // empty' "$(global_config $(seat_dir $name))" 2>/dev/null)
+  [[ -n $device ]] || die "$name has no paired browser yet. Start a session on it, run /chrome, pick the browser, then: ccseats pair $name"
+  jq --arg n $name --arg d $device '.seats[$n].device = $d' $CONFIG > $CONFIG.tmp && mv $CONFIG.tmp $CONFIG
+  pin_device $name "$(seat_dir $name)"
+  print "seat $name pinned to browser ${device:0:8}, shown as \"$name\""
+}
+
 # Claude Code prefers a token or API key from the environment over the stored login, which would
 # silently run every seat on the same account, so those are dropped.
 run_seat() {
-  local dir=$(seat_dir $1); shift
+  local dir=$(seat_dir $1)
   [[ -d $dir ]] || die "$dir does not exist. Run: ccseats relink"
+  pin_device $1 $dir; shift
   if [[ $dir == $DEFAULT_DIR ]]; then exec env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY claude "$@"; fi
   exec env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR=$dir claude "$@"
 }
@@ -333,6 +356,7 @@ ccseats $VERSION - several Claude Code accounts side by side
   ccseats <seat> [claude args]         run claude on that seat
   ccseats [claude args]                run claude on the picked seat if autoPick is on, else the first seat
   ccseats chrome <seat>                open the Chrome profile mapped to that seat
+  ccseats pair <seat>                  pin the browser the seat is paired with now, labelled with the seat name
   ccseats statusline                   seat name and remaining budget, for a statusline script
   ccseats relink                       recreate the shared symlinks in every seat
 
@@ -349,6 +373,7 @@ case ${1:-} in
   init) cmd_init ;;
   add) shift; cmd_add "$@" ;;
   remove) shift; need_config; cmd_remove "$@" ;;
+  pair) shift; need_config; cmd_pair "$@" ;;
   relink) cmd_relink ;;
   status|usage) need_config; colours_for 1; refresh_all; table ;;
   pick) need_config; colours_for 2; refresh_all; chosen=$(pick); table $chosen >&2; [[ -n $chosen ]] || die "every seat is locked or over its weekly cap"; print -r -- $chosen ;;

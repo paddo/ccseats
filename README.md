@@ -51,6 +51,7 @@ Your existing `~/.claude` is not moved or changed. It becomes the first seat and
 | `ccseats <seat> [claude args]` | Run `claude` on that seat |
 | `ccseats [claude args]` | Run `claude` on the picked seat when `autoPick` is on, otherwise on the first seat |
 | `ccseats chrome <seat>` | Open the Chrome profile mapped to that seat |
+| `ccseats pair <seat>` | Pin the browser the seat is paired with now, labelled with the seat name |
 | `ccseats statusline` | Seat name and remaining budget, for a statusline script |
 | `ccseats relink` | Recreate the shared symlinks in every seat |
 
@@ -107,7 +108,7 @@ Rules:
 {
   "seats": {
     "main": { "dir": "~/.claude", "chrome": "Default", "tier": 1 },
-    "work": { "dir": "~/.claude-work", "chrome": "Profile 1", "tier": 1 },
+    "work": { "dir": "~/.claude-work", "chrome": "Profile 1", "tier": 1, "device": "d102d8b0-763b-46a5-b4d9-6412db83484f" },
     "side": { "dir": "~/.claude-side", "chrome": "Profile 2", "tier": 2, "maxWeekly": 70 }
   },
   "model": "Fable",
@@ -116,7 +117,7 @@ Rules:
 }
 ```
 
-`model` is the display name of the model whose weekly limit you want to protect, as it appears in `/usage`. Seat order in the file is the display order.
+`device` is set by `ccseats pair`. `model` is the display name of the model whose weekly limit you want to protect, as it appears in `/usage`. Seat order in the file is the display order.
 
 ## Statusline
 
@@ -137,12 +138,14 @@ printf " | %s" "$(ccseats statusline)"
 One Chrome profile per seat keeps every account signed in with no re-pairing.
 
 1. `ccseats chrome <seat>` opens the mapped Chrome profile (`google-chrome` or `chromium` on Linux). Install the Claude extension in it and sign in to claude.ai with that seat's account.
-2. In a session on that seat, run `/chrome` and pick that browser. The pairing is stored in the seat's own `.claude.json`, so later sessions on the seat use it with no further steps.
+2. In a session on that seat, run `/chrome` and pick that browser.
+3. `ccseats pair <seat>` saves that browser's id in the config. From then on every launch of the seat writes it back before Claude Code starts, labelled with the seat name, so the pairing cannot drift and `/chrome` shows `work` instead of "Browser 1".
 
 Things worth knowing:
 
-- Every Chrome window with the extension shows up in every seat's `/chrome` list. Nothing checks the account at selection time. The stored pairing is what keeps seats apart.
-- Give each browser a distinct name. Picking from the `/chrome` list does not offer a name field. To get one, ask Claude in that session to "switch browser and let me pick it in Chrome". That sends a Connect prompt to every window, and the prompt has the name field.
+- Every Chrome window with the extension shows up in every seat's `/chrome` list. Nothing checks the account at selection time. The pinned id is what keeps seats apart.
+- Windows are called "Browser 1" by default, and two of them look the same in the `/chrome` list. If you cannot tell them apart, ask Claude in that session to "switch browser and let me pick it in Chrome". That sends a Connect prompt to every window, and the one you accept in is the one that gets paired. Then run `ccseats pair`.
+- To move a seat to a different window, run `/chrome` in a session, pick the new one, and run `ccseats pair <seat>` again.
 
 ## Caveats
 
