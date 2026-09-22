@@ -37,7 +37,7 @@ ccseats work                              # starts claude on that seat. Run /log
 ccseats status
 ```
 
-Your existing `~/.claude` is not moved or changed. It becomes the first seat and the source of everything the other seats share.
+Your existing `~/.claude` is not moved or changed. It becomes the first seat and the source of everything the other seats share. Add as many seats as you have accounts, and `ccseats remove <seat> --purge` takes one away again.
 
 ## Commands
 
@@ -45,6 +45,7 @@ Your existing `~/.claude` is not moved or changed. It becomes the first seat and
 |---|---|
 | `ccseats init` | Create the config with seat `main` on `~/.claude` |
 | `ccseats add <name> [--chrome "Profile 1"] [--tier N] [--max-weekly N]` | Create `~/.claude-<name>` and link the shared items |
+| `ccseats remove <seat> [--purge]` | Forget a seat. `--purge` also deletes its directory and stored login |
 | `ccseats status` | Usage table for every seat. Alias: `usage` |
 | `ccseats pick` | Show the table and print the seat the picker would choose |
 | `ccseats <seat> [claude args]` | Run `claude` on that seat |

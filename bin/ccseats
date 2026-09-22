@@ -228,7 +228,7 @@ cmd_init() {
 cmd_add() {
   local name=${1:-} chrome="" tier=1 maxw=""
   [[ $name =~ '^[a-z0-9][a-z0-9_-]*$' ]] || die "usage: ccseats add <name> [--chrome \"Profile 1\"] [--tier N] [--max-weekly N]"
-  [[ $name == (help|init|add|relink|status|usage|pick|chrome|statusline) ]] && die "$name is a ccseats command, choose another seat name"
+  [[ $name == (help|init|add|remove|relink|status|usage|pick|chrome|statusline) ]] && die "$name is a ccseats command, choose another seat name"
   shift
   while (( $# )); do
     (( $# >= 2 )) || die "$1 needs a value"
@@ -248,6 +248,26 @@ cmd_add() {
     '.seats[$n] = ({dir: "~/.claude-\($n)", tier: $t} + (if $c != "" then {chrome: $c} else {} end) + (if $m != "" then {maxWeekly: ($m | tonumber)} else {} end))' \
     $CONFIG > $CONFIG.tmp && mv $CONFIG.tmp $CONFIG
   print "seat $name ready at $dir. Next: ccseats $name, then /login with that account."
+}
+
+# Removing a seat forgets it. --purge also deletes its directory and stored login, which is
+# the seat's own state only: everything shared is a symlink back to the default directory.
+cmd_remove() {
+  local name=${1:-} purge=${2:-}
+  has_seat $name || die "usage: ccseats remove <seat> [--purge]"
+  [[ -z $purge || $purge == --purge ]] || die "unknown option $purge"
+  local dir=$(seat_dir $name)
+  jq --arg n $name 'del(.seats[$n])' $CONFIG > $CONFIG.tmp && mv $CONFIG.tmp $CONFIG
+  if [[ $purge == --purge ]]; then
+    [[ $dir == $DEFAULT_DIR ]] && die "$name was removed from the config, but ~/.claude is never deleted"
+    if [[ $OSTYPE == darwin* ]]; then
+      security delete-generic-password -a "$USER" -s "$(keychain_service $dir)" >/dev/null 2>&1
+    fi
+    rm -rf $dir
+    print "removed seat $name and deleted $dir"
+  else
+    print "removed seat $name. Its directory and login are untouched: $dir"
+  fi
 }
 
 cmd_relink() { need_config; local n d; for n in $(seats); do d=$(seat_dir $n); [[ $d == $DEFAULT_DIR ]] || { link_shared $d; print "relinked $n" } done }
@@ -307,6 +327,7 @@ ccseats $VERSION - several Claude Code accounts side by side
 
   ccseats init                         create the config with seat "main" on ~/.claude
   ccseats add <name> [--chrome "Profile 1"] [--tier N] [--max-weekly N]
+  ccseats remove <seat> [--purge]      forget a seat; --purge also deletes its directory and login
   ccseats status                       usage table for every seat (alias: usage)
   ccseats pick                         show the table and the seat the picker would choose
   ccseats <seat> [claude args]         run claude on that seat
@@ -327,6 +348,7 @@ case ${1:-} in
   -v|--version) print $VERSION ;;
   init) cmd_init ;;
   add) shift; cmd_add "$@" ;;
+  remove) shift; need_config; cmd_remove "$@" ;;
   relink) cmd_relink ;;
   status|usage) need_config; colours_for 1; refresh_all; table ;;
   pick) need_config; colours_for 2; refresh_all; chosen=$(pick); table $chosen >&2; [[ -n $chosen ]] || die "every seat is locked or over its weekly cap"; print -r -- $chosen ;;
