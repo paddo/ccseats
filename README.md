@@ -52,7 +52,7 @@ Your existing `~/.claude` is not moved or changed. It becomes the first seat and
 | `ccseats [claude args]` | Run `claude` on the picked seat when `autoPick` is on, otherwise on the first seat |
 | `ccseats chrome <seat>` | Open the Chrome profile mapped to that seat |
 | `ccseats pair <seat>` | Pin the browser the seat is paired with now, labelled with the seat name |
-| `ccseats statusline` | Seat name and remaining budget, for a statusline script |
+| `ccseats statusline` | Seat name and remaining 5h, weekly and model budget, for a statusline script |
 | `ccseats relink` | Recreate the shared symlinks in every seat |
 
 Everything after the seat name goes to `claude` unchanged: `ccseats work --resume`.
@@ -94,11 +94,12 @@ Off by default. Set `"autoPick": true` in the config and a bare `ccseats` starts
 
 Rules:
 
-1. Lowest `tier` first. A higher tier is used only when every seat in the lower tiers is over a threshold.
-2. Inside a tier: most headroom on the protected model, then most 5-hour headroom, then fewest live sessions.
-3. A seat is skipped when it is locked, when its 5-hour or model usage is over the thresholds, or when its weekly usage is over its own `maxWeekly`.
+1. Lowest `tier` first. A higher tier is used only when every seat in the lower tiers is at or over a threshold.
+2. Inside a tier: most weekly headroom, counting whichever of the all-models week and the model bucket is tighter, then most 5-hour headroom, then fewest live sessions.
+3. A seat is skipped when it is locked, when its 5-hour, weekly or model usage is at or over its threshold, or when its weekly usage is at or over its own `maxWeekly`.
+4. When every seat is at or over a threshold, the picker takes the one with the lowest 5-hour usage. A locked or capped seat is never picked.
 
-`tier` and `maxWeekly` are optional. A higher `tier` means the seat is used later. `maxWeekly` takes a seat out of the running once its week passes that percentage.
+`tier` and `maxWeekly` are optional. A higher `tier` means the seat is used later. `maxWeekly` takes a seat out of the running once its week reaches that percentage.
 
 ## Config
 
@@ -113,18 +114,18 @@ Rules:
   },
   "model": "Fable",
   "autoPick": false,
-  "thresholds": { "session": 90, "model": 85 }
+  "thresholds": { "session": 90, "weekly": 90, "model": 85 }
 }
 ```
 
-`device` is set by `ccseats pair`. `model` is the display name of the model whose weekly limit you want to protect, as it appears in `/usage`. Seat order in the file is the display order.
+`device` is set by `ccseats pair`. `model` is the display name of the model whose weekly bucket the picker also checks, as it appears in `/usage`. Seat order in the file is the display order.
 
 ## Statusline
 
-`ccseats statusline` prints the seat name and the remaining 5-hour and model budget:
+`ccseats statusline` prints the seat name and the remaining budget: 5-hour session, weekly across all models, and the weekly limit of the configured model (`f` for Fable):
 
 ```
-work 5h 93% fable 46% left
+work 5h 93% w 61% f 46% left
 ```
 
 It never waits on the network. A stale cache starts a background refresh and the previous values show. Call it from your statusline script:

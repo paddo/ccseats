@@ -138,15 +138,16 @@ rows() {
   done
 }
 
-# Lowest tier first. Inside a tier the seat with the most model headroom wins, then 5h headroom,
-# then fewest live sessions. A seat over a threshold, or over its own maxWeekly, is skipped. When
+# Lowest tier first. Inside a tier the seat with the most weekly headroom wins, counting whichever of
+# the all-models week and the model bucket is tighter, then 5h headroom, then fewest live sessions. A seat over a threshold, or over its own maxWeekly, is skipped. When
 # every seat is over a threshold the least used one is picked, but a locked or capped seat never is.
 pick() {
-  local ts=$(cfg '.thresholds.session // 90') tm=$(cfg '.thresholds.model // 85')
-  rows | awk -F$SEP -v ts=$ts -v tm=$tm '
+  local ts=$(cfg '.thresholds.session // 90') tw=$(cfg '.thresholds.weekly // 90') tm=$(cfg '.thresholds.model // 85')
+  rows | awk -F$SEP -v ts=$ts -v tw=$tw -v tm=$tm '
     { known = ($4 != ""); usable = known && $11 !~ /^locked/ && ($10 == "" || $5 < $10)
-      ok = usable && $4 < ts && ($6 == "" ? 0 : $6) < tm
-      if (ok) printf "%d\t%09.3f\t%09.3f\t%05d\t%s\n", $2, ($6 == "" ? 0 : $6), $4, $9, $1
+      w = ($5 == "" ? 0 : $5); m = ($6 == "" ? 0 : $6)
+      ok = usable && $4 < ts && w < tw && m < tm
+      if (ok) printf "%d\t%09.3f\t%09.3f\t%05d\t%s\n", $2, (w > m ? w : m), $4, $9, $1
       if (usable && (best == "" || $4 < bests)) { best = $1; bests = $4 } }
     END { if (best != "") print "9999999\t\t\t\t" best }' | LC_ALL=C sort -n | head -1 | cut -f5
 }
@@ -221,7 +222,7 @@ link_shared() {
 cmd_init() {
   [[ -f $CONFIG ]] && die "$CONFIG already exists"
   mkdir -p ${CONFIG:h}
-  jq -n '{seats: {main: {dir: "~/.claude", chrome: "Default", tier: 1}}, model: "Fable", autoPick: false, thresholds: {session: 90, model: 85}}' > $CONFIG
+  jq -n '{seats: {main: {dir: "~/.claude", chrome: "Default", tier: 1}}, model: "Fable", autoPick: false, thresholds: {session: 90, weekly: 90, model: 85}}' > $CONFIG
   print "created $CONFIG with seat \"main\" on ~/.claude. Add more with: ccseats add <name>"
 }
 
@@ -285,7 +286,7 @@ cmd_chrome() {
   fi
 }
 
-# Segment for a Claude Code statusline script: seat name plus remaining 5h and model budget.
+# Segment for a Claude Code statusline script: seat name plus remaining 5h, weekly and model budget.
 # Never waits on the network: a stale cache triggers a background refresh and the old values show.
 cmd_statusline() {
   need_config
@@ -303,7 +304,7 @@ cmd_statusline() {
   out="$C_MAGENTA$name$C_RESET"
   if [[ -n $s ]]; then
     local part v left
-    for part in "5h:$s" "${model:l}:$m"; do
+    for part in "5h:$s" "w:${w:-0}" "${${model[1]}:l}:$m"; do
       v=${part#*:}; left=$(( 100 - ${v%.*} ))
       out+=" ${part%%:*} $( (( left >= 50 )) && print -rn -- $C_GREEN || { (( left >= 20 )) && print -rn -- $C_YELLOW || print -rn -- $C_RED } )$left%$C_RESET"
     done
