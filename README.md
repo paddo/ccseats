@@ -134,6 +134,26 @@ It never waits on the network. A stale cache starts a background refresh and the
 printf " | %s" "$(ccseats statusline)"
 ```
 
+## Claude Code mod
+
+The `plugin/` folder is a Claude Code mod (Claude Code 2.1.287 or later). It runs inside the session and adds:
+
+- `/seats`: a pane with 5h, weekly and model meters for every seat, and the time to each reset. `●` marks this session's seat, `★` the seat the picker would choose.
+- A band above the prompt when this seat is over a picker threshold.
+- Handoff. A digit in the pane resumes this conversation on that seat in a new tab, as `ccseats <seat> --resume <id> --fork-session`. The seats share `projects/`, so the transcript is already there.
+- Handoff to Codex or Grok (`c`, `g`). Those tools cannot read a Claude transcript, so Claude first writes a handoff brief over its own cached transcript to `~/.cache/ccseats/handoffs/`. The other agent starts with that brief.
+
+Install it once. The seats share `plugins/` and `settings.json`, so every seat gets it:
+
+```sh
+claude plugin marketplace add paddo/ccseats
+claude plugin install ccseats@ccseats
+```
+
+New tabs open in herdr, tmux, WezTerm and kitty. kitty needs `allow_remote_control` in `kitty.conf`. In any other terminal the command goes to the clipboard (`pbcopy`, `wl-copy` or `xclip`), or into the transcript when no clipboard tool exists.
+
+The mod reads only the local usage caches, so it adds no requests to the usage endpoint. The first turn on a new seat is not cached, because the prompt cache belongs to one account.
+
 ## Claude in Chrome
 
 One Chrome profile per seat keeps every account signed in with no re-pairing.

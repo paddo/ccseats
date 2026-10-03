@@ -1,0 +1,10 @@
+{
+  "name": "ccseats",
+  "version": "0.1.0",
+  "description": "Live usage meters for every ccseats seat in Claude Code, and a one-key handoff of the conversation to the seat with the most headroom, or to Codex or Grok",
+  "author": { "name": "paddo" },
+  "homepage": "https://github.com/paddo/ccseats#claude-code-mod",
+  "repository": "https://github.com/paddo/ccseats",
+  "license": "MIT",
+  "types": "./types/index.d.ts"
+}
