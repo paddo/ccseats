@@ -13,17 +13,17 @@ const BAND = {
 
 const NOW = Date.parse('2026-10-03T03:00:00Z')
 
-const cache = (session: number, weekly: number) =>
+const cache = (session: number, weekly: number, weeklyReset = '2026-10-09T08:00:00Z') =>
   JSON.stringify({
     limits: [
       { kind: 'session', percent: session, resets_at: '2026-10-03T05:00:00Z', scope: null },
-      { kind: 'weekly_all', percent: weekly, resets_at: '2026-10-09T08:00:00Z', scope: null },
+      { kind: 'weekly_all', percent: weekly, resets_at: weeklyReset, scope: null },
     ],
   })
 
 const files = (p1: number, p2: number, p3: number): Record<string, string> => ({
   '/h/.config/ccseats/config.json': JSON.stringify({
-    seats: { p1: { dir: '~/.claude', tier: 1 }, p2: { dir: '~/.claude-p2', tier: 1 }, p3: { dir: '~/.claude-p3', tier: 2 } },
+    seats: { p1: { dir: '~/.claude' }, p2: { dir: '~/.claude-p2' }, p3: { dir: '~/.claude-p3', maxWeekly: 10 } },
     thresholds: { session: 90, weekly: 90, model: 85 },
   }),
   '/h/.claude/usage-cache.json': cache(p1, 40),
@@ -87,7 +87,7 @@ test('a low seat offers handoff to the best seat and resumes there in a new herd
 
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ plugin: 'ccseats', surface, component: 'AbovePrompt', props: BAND })
-    // p2 beats p3 on tier, though p3 has more room.
+    // p2 beats p3, though p3 has used less of its week: p3 is near its maxWeekly.
     expect(await ui.find({ key: 'handoff' })).toBeDefined()
     expect(await ui.find({ type: 'Text', text: /p1 is low.*p2 has/ })).toBeDefined()
     await ui.unmount()
@@ -100,6 +100,18 @@ test('a low seat offers handoff to the best seat and resumes there in a new herd
     ['herdr', 'tab', 'create', '--workspace', 'w3', '--cwd', '/work', '--label', 'p2', '--focus'],
     ['herdr', 'pane', 'run', 'w3:p9', 'ccseats p2 --resume sess-1 --fork-session'],
   ])
+})
+
+test('a seat whose week resets sooner wins, though it has used more of its week', async ($, on) => {
+  const fs = files(95, 10, 0)
+  fs['/h/.config/ccseats/config.json'] = JSON.stringify({ seats: { p1: { dir: '~/.claude' }, p2: { dir: '~/.claude-p2' }, p3: { dir: '~/.claude-p3' } } })
+  fs['/h/.claude-p2/usage-cache.json'] = cache(10, 20)
+  fs['/h/.claude-p3/usage-cache.json'] = cache(0, 70, '2026-10-04T03:00:00Z')
+  world(on, fs)
+  await $.session.start({ cwd: '/work', surface: 'terminal', isInteractive: true })
+  const ui = await $.ui.mount({ plugin: 'ccseats', surface: 'terminal', component: 'AbovePrompt', props: BAND })
+  // p3: 20% left over 1 day. p2: 70% left over about 6 days.
+  expect(await ui.find({ type: 'Text', text: /p1 is low.*p3 has/ })).toBeDefined()
 })
 
 test('with every seat low, codex gets a brief written over the transcript', async ($, on) => {

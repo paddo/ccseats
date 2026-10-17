@@ -2,14 +2,14 @@
 
 Run several Claude Code accounts side by side on one machine. macOS and Linux.
 
-Each account is a "seat". Seats stay signed in at the same time, share one set of plugins, skills, settings and session transcripts, and show their remaining quota in one table. An optional picker starts each new session on the seat with the most headroom.
+Each account is a "seat". Seats stay signed in at the same time, share one set of plugins, skills, settings and session transcripts, and show their remaining quota in one table. An optional picker starts each new session on the seat whose weekly headroom would otherwise expire first.
 
 ```
-seat  tier  email              5h   7d  fable  5h reset   7d reset   live  note
-───────────────────────────────────────────────────────────────────────────────
-main     1  you@example.com    7%  39%    54%  Tue 04:30  Fri 18:00     3
-work     1  work@example.com   0%  62%    92%  -          Thu 10:00     0
-side     2  side@example.com   0%   0%     0%  -          Sun 15:00     0
+seat  email              5h   7d  fable  5h reset   7d reset   live  note
+─────────────────────────────────────────────────────────────────────────
+main  you@example.com    7%  39%    54%  Tue 04:30  Fri 18:00     3
+work  work@example.com   0%  62%    92%  -          Thu 10:00     0
+side  side@example.com   0%   0%     0%  -          Sun 15:00     0
 ```
 
 One zsh script. On macOS it needs only what the system ships. On Linux it needs `zsh`, `jq` and `curl`.
@@ -44,7 +44,7 @@ Your existing `~/.claude` is not moved or changed. It becomes the first seat and
 | command | what it does |
 |---|---|
 | `ccseats init` | Create the config with seat `main` on `~/.claude` |
-| `ccseats add <name> [--chrome "Profile 1"] [--tier N] [--max-weekly N]` | Create `~/.claude-<name>` and link the shared items |
+| `ccseats add <name> [--chrome "Profile 1"] [--max-weekly N]` | Create `~/.claude-<name>` and link the shared items |
 | `ccseats remove <seat> [--purge]` | Forget a seat. `--purge` also deletes its directory and stored login |
 | `ccseats status` | Usage table for every seat. Alias: `usage` |
 | `ccseats pick` | Show the table and print the seat the picker would choose |
@@ -94,12 +94,12 @@ Off by default. Set `"autoPick": true` in the config and a bare `ccseats` starts
 
 Rules:
 
-1. Lowest `tier` first. A higher tier is used only when every seat in the lower tiers is at or over a threshold.
-2. Inside a tier: most weekly headroom, counting whichever of the all-models week and the model bucket is tighter, then most 5-hour headroom, then fewest live sessions.
+1. Most weekly headroom per day left until the weekly reset. Headroom that is not used before the reset is lost, so a seat whose week ends tomorrow goes before a seat with more headroom and five days left. Headroom counts whichever is tighter: the all-models week (up to the weekly threshold or `maxWeekly`) or the model bucket.
+2. On a tie: lowest 5-hour usage, then fewest live sessions.
 3. A seat is skipped when it is locked, when its 5-hour, weekly or model usage is at or over its threshold, or when its weekly usage is at or over its own `maxWeekly`.
 4. When every seat is at or over a threshold, the picker takes the one with the lowest 5-hour usage. A locked or capped seat is never picked.
 
-`tier` and `maxWeekly` are optional. A higher `tier` means the seat is used later. `maxWeekly` takes a seat out of the running once its week reaches that percentage.
+`maxWeekly` is optional. It takes a seat out of the running once its week reaches that percentage, which keeps a reserve on that account for work you start on it directly.
 
 ## Config
 
@@ -108,9 +108,9 @@ Rules:
 ```json
 {
   "seats": {
-    "main": { "dir": "~/.claude", "chrome": "Default", "tier": 1 },
-    "work": { "dir": "~/.claude-work", "chrome": "Profile 1", "tier": 1, "device": "d102d8b0-763b-46a5-b4d9-6412db83484f" },
-    "side": { "dir": "~/.claude-side", "chrome": "Profile 2", "tier": 2, "maxWeekly": 70 }
+    "main": { "dir": "~/.claude", "chrome": "Default" },
+    "work": { "dir": "~/.claude-work", "chrome": "Profile 1", "device": "d102d8b0-763b-46a5-b4d9-6412db83484f" },
+    "side": { "dir": "~/.claude-side", "chrome": "Profile 2", "maxWeekly": 85 }
   },
   "model": "Fable",
   "autoPick": false,

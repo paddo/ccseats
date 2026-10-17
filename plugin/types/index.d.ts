@@ -1,7 +1,6 @@
 export type Seat = {
   name: string
   dir: string
-  tier: number
   maxWeekly: number | null
   session: number | null
   weekly: number | null

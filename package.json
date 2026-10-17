@@ -1,6 +1,6 @@
 {
   "name": "ccseats",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Run several Claude Code accounts side by side on macOS and Linux: shared plugins, skills and transcripts, per-account logins, a usage table, and a limit-aware seat picker.",
   "bin": { "ccseats": "bin/ccseats" },
   "files": ["bin", "README.md", "LICENSE"],

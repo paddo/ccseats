@@ -6,7 +6,7 @@
 emulate -L zsh
 setopt pipe_fail extended_glob
 
-VERSION=0.1.0
+VERSION=0.2.0
 CONFIG=${CCSEATS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ccseats/config.json}
 DEFAULT_DIR=$HOME/.claude
 USAGE_URL=https://api.anthropic.com/api/oauth/usage
@@ -120,13 +120,13 @@ usage_fields() {
     | [($s | used), ($w | used), ($x | used), ($s | reset), ($w | reset)] | map(tostring) | join("\u001f")' $1
 }
 
-# One line per seat: name tier email session weekly model resetSession resetWeekly live maxWeekly note
+# One line per seat: name email session weekly model resetSession resetWeekly live maxWeekly note
 rows() {
   local n dir cache
   for n in $(seats); do
     dir=$(seat_dir $n); cache=$dir/usage-cache.json
     local email=$(jq -r '.oauthAccount.emailAddress // "-"' "$(global_config $dir)" 2>/dev/null)
-    local tier=$(cfg --arg n $n '.seats[$n].tier // 1') maxw=$(cfg --arg n $n '.seats[$n].maxWeekly // ""')
+    local maxw=$(cfg --arg n $n '.seats[$n].maxWeekly // ""')
     local usage="$SEP$SEP$SEP$SEP" note=""
     if [[ -f $cache ]]; then
       usage=$(usage_fields $cache)
@@ -134,22 +134,26 @@ rows() {
     fi
     # The lock must stay visible to the picker, so a fetch note is appended rather than substituted.
     [[ -f $dir/usage-cache.note ]] && note="${note:+$note; }$(<$dir/usage-cache.note)"
-    print -r -- "$n$SEP$tier$SEP${email:--}$SEP$usage$SEP$(live_sessions $dir)$SEP$maxw$SEP$note"
+    print -r -- "$n$SEP${email:--}$SEP$usage$SEP$(live_sessions $dir)$SEP$maxw$SEP$note"
   done
 }
 
-# Lowest tier first. Inside a tier the seat with the most weekly headroom wins, counting whichever of
-# the all-models week and the model bucket is tighter, then 5h headroom, then fewest live sessions. A seat over a threshold, or over its own maxWeekly, is skipped. When
-# every seat is over a threshold the least used one is picked, but a locked or capped seat never is.
+# Weekly headroom left unused at the reset is lost, so the seat with the most headroom per day left
+# in its week wins: headroom to the tighter of the all-models week (or maxWeekly) and the model
+# bucket, divided by days to the weekly reset. Ties go to the lower 5h use, then fewest
+# live sessions. A seat over a threshold, or over its own maxWeekly, is skipped. When every seat is
+# over a threshold the least used one is picked, but a locked or capped seat never is.
 pick() {
   local ts=$(cfg '.thresholds.session // 90') tw=$(cfg '.thresholds.weekly // 90') tm=$(cfg '.thresholds.model // 85')
-  rows | awk -F$SEP -v ts=$ts -v tw=$tw -v tm=$tm '
-    { known = ($4 != ""); usable = known && $11 !~ /^locked/ && ($10 == "" || $5 < $10)
-      w = ($5 == "" ? 0 : $5); m = ($6 == "" ? 0 : $6)
-      ok = usable && $4 < ts && w < tw && m < tm
-      if (ok) printf "%d\t%09.3f\t%09.3f\t%05d\t%s\n", $2, (w > m ? w : m), $4, $9, $1
-      if (usable && (best == "" || $4 < bests)) { best = $1; bests = $4 } }
-    END { if (best != "") print "9999999\t\t\t\t" best }' | LC_ALL=C sort -n | head -1 | cut -f5
+  rows | awk -F$SEP -v ts=$ts -v tw=$tw -v tm=$tm -v now=$(date +%s) '
+    { known = ($3 != ""); usable = known && $10 !~ /^locked/ && ($9 == "" || $4 < $9)
+      w = ($4 == "" ? 0 : $4); m = ($5 == "" ? 0 : $5)
+      ok = usable && $3 < ts && w < tw && m < tm
+      cap = ($9 != "" && $9 < tw ? $9 : tw); room = (cap - w < tm - m ? cap - w : tm - m)
+      days = ($7 == "" ? 7 : ($7 - now) / 86400); if (days < 1 / 1440) days = 1 / 1440
+      if (ok) printf "%011.3f\t%09.3f\t%05d\t%s\n", 1000000 - room / days, $3, $8, $1
+      if (usable && (best == "" || $3 < bests)) { best = $1; bests = $3 } }
+    END { if (best != "") print "9999999.999\t\t\t" best }' | LC_ALL=C sort -n | head -1 | cut -f4
 }
 
 colours() {
@@ -166,30 +170,30 @@ when() { [[ -n $1 ]] && clock ${1%.*} || print -- - }
 
 table() {
   local chosen=${1:-} model=$(cfg '.model // "Fable"' | tr '[:upper:]' '[:lower:]')
-  local -a head=(seat tier email 5h 7d $model "5h reset" "7d reset" live note) right=(0 1 0 1 1 1 0 0 1 0)
+  local -a head=(seat email 5h 7d $model "5h reset" "7d reset" live note) right=(0 0 1 1 1 0 0 1 0)
   local -a cells colours widths row col
-  local line i r text padded n tier email s w m rs rw live maxw note
-  for i in {1..10}; do widths[i]=${#head[i]}; done
-  while IFS=$SEP read -r n tier email s w m rs rw live maxw note; do
-    row=("$n" "$tier" "$email" "${s:+${s%.*}%}" "${w:+${w%.*}%}" "${m:+${m%.*}%}" "$(when "$rs")" "$(when "$rw")" "$live" "$note")
-    col=("$C_BOLD$C_MAGENTA" "$C_DIM" "" "${s:+$(used_colour $s)}" "${w:+$(used_colour $w)}" "${m:+$(used_colour $m)}" "$C_DIM" "$C_DIM" "" "$C_YELLOW")
-    [[ -z $s ]] && row[4]=- row[5]=- row[6]=-
-    [[ -n $s && -z $m ]] && row[6]=0% col[6]=$C_GREEN
-    for i in {1..10}; do (( ${#row[i]} > widths[i] )) && widths[i]=${#row[i]}; done
+  local line i r text padded n email s w m rs rw live maxw note
+  for i in {1..9}; do widths[i]=${#head[i]}; done
+  while IFS=$SEP read -r n email s w m rs rw live maxw note; do
+    row=("$n" "$email" "${s:+${s%.*}%}" "${w:+${w%.*}%}" "${m:+${m%.*}%}" "$(when "$rs")" "$(when "$rw")" "$live" "$note")
+    col=("$C_BOLD$C_MAGENTA" "" "${s:+$(used_colour $s)}" "${w:+$(used_colour $w)}" "${m:+$(used_colour $m)}" "$C_DIM" "$C_DIM" "" "$C_YELLOW")
+    [[ -z $s ]] && row[3]=- row[4]=- row[5]=-
+    [[ -n $s && -z $m ]] && row[5]=0% col[5]=$C_GREEN
+    for i in {1..9}; do (( ${#row[i]} > widths[i] )) && widths[i]=${#row[i]}; done
     cells+=("${row[@]}"); colours+=("${col[@]}")
   done < <(rows)
   local mark="" ; [[ -n $chosen ]] && mark="    "
   line=$mark
-  for i in {1..10}; do (( right[i] )) && line+="${(l:widths[i]:)head[i]}  " || line+="${(r:widths[i]:)head[i]}  "; done
+  for i in {1..9}; do (( right[i] )) && line+="${(l:widths[i]:)head[i]}  " || line+="${(r:widths[i]:)head[i]}  "; done
   print -r -- "$C_DIM${line%% #}$C_RESET"
   print -r -- "$C_DIM${(l:${#${line%% #}}::─:)}$C_RESET"
-  for (( r = 0; r < ${#cells} / 10; r++ )); do
+  for (( r = 0; r < ${#cells} / 9; r++ )); do
     line=""
-    [[ -n $chosen ]] && { [[ ${cells[r*10+1]} == $chosen ]] && line="$C_CYAN->$C_RESET  " || line="    " }
-    for i in {1..10}; do
-      text=${cells[r*10+i]}
+    [[ -n $chosen ]] && { [[ ${cells[r*9+1]} == $chosen ]] && line="$C_CYAN->$C_RESET  " || line="    " }
+    for i in {1..9}; do
+      text=${cells[r*9+i]}
       (( right[i] )) && padded=${(l:widths[i]:)text} || padded=${(r:widths[i]:)text}
-      line+="${colours[r*10+i]}$padded$C_RESET  "
+      line+="${colours[r*9+i]}$padded$C_RESET  "
     done
     print -r -- "${line%% #}"
   done
@@ -222,20 +226,19 @@ link_shared() {
 cmd_init() {
   [[ -f $CONFIG ]] && die "$CONFIG already exists"
   mkdir -p ${CONFIG:h}
-  jq -n '{seats: {main: {dir: "~/.claude", chrome: "Default", tier: 1}}, model: "Fable", autoPick: false, thresholds: {session: 90, weekly: 90, model: 85}}' > $CONFIG
+  jq -n '{seats: {main: {dir: "~/.claude", chrome: "Default"}}, model: "Fable", autoPick: false, thresholds: {session: 90, weekly: 90, model: 85}}' > $CONFIG
   print "created $CONFIG with seat \"main\" on ~/.claude. Add more with: ccseats add <name>"
 }
 
 cmd_add() {
-  local name=${1:-} chrome="" tier=1 maxw=""
-  [[ $name =~ '^[a-z0-9][a-z0-9_-]*$' ]] || die "usage: ccseats add <name> [--chrome \"Profile 1\"] [--tier N] [--max-weekly N]"
+  local name=${1:-} chrome="" maxw=""
+  [[ $name =~ '^[a-z0-9][a-z0-9_-]*$' ]] || die "usage: ccseats add <name> [--chrome \"Profile 1\"] [--max-weekly N]"
   [[ $name == (help|init|add|remove|relink|status|usage|pick|chrome|pair|statusline) ]] && die "$name is a ccseats command, choose another seat name"
   shift
   while (( $# )); do
     (( $# >= 2 )) || die "$1 needs a value"
     case $1 in
       --chrome) chrome=$2 ;;
-      --tier) [[ $2 == <1-> ]] || die "--tier needs a whole number"; tier=$2 ;;
       --max-weekly) [[ $2 == <0-100> ]] || die "--max-weekly needs 0 to 100"; maxw=$2 ;;
       *) die "unknown option $1" ;;
     esac
@@ -245,8 +248,8 @@ cmd_add() {
   has_seat $name && die "seat $name already exists"
   local dir=$HOME/.claude-$name
   link_shared $dir
-  jq --arg n $name --arg c "$chrome" --argjson t $tier --arg m "$maxw" \
-    '.seats[$n] = ({dir: "~/.claude-\($n)", tier: $t} + (if $c != "" then {chrome: $c} else {} end) + (if $m != "" then {maxWeekly: ($m | tonumber)} else {} end))' \
+  jq --arg n $name --arg c "$chrome" --arg m "$maxw" \
+    '.seats[$n] = ({dir: "~/.claude-\($n)"} + (if $c != "" then {chrome: $c} else {} end) + (if $m != "" then {maxWeekly: ($m | tonumber)} else {} end))' \
     $CONFIG > $CONFIG.tmp && mv $CONFIG.tmp $CONFIG
   print "seat $name ready at $dir. Next: ccseats $name, then /login with that account."
 }
@@ -264,7 +267,7 @@ cmd_remove() {
     if [[ $OSTYPE == darwin* ]]; then
       security delete-generic-password -a "$USER" -s "$(keychain_service $dir)" >/dev/null 2>&1
     fi
-    rm -rf $dir
+    rm -rf ${dir:?}
     print "removed seat $name and deleted $dir"
   else
     print "removed seat $name. Its directory and login are untouched: $dir"
@@ -350,7 +353,7 @@ usage() {
 ccseats $VERSION - several Claude Code accounts side by side
 
   ccseats init                         create the config with seat "main" on ~/.claude
-  ccseats add <name> [--chrome "Profile 1"] [--tier N] [--max-weekly N]
+  ccseats add <name> [--chrome "Profile 1"] [--max-weekly N]
   ccseats remove <seat> [--purge]      forget a seat; --purge also deletes its directory and login
   ccseats status                       usage table for every seat (alias: usage)
   ccseats pick                         show the table and the seat the picker would choose

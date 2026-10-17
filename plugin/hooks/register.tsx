@@ -31,17 +31,21 @@ function overThreshold(seat: Seat, t: Seats['thresholds']) {
   return (seat.session ?? 0) >= t.session || (seat.weekly ?? 0) >= t.weekly || (seat.model ?? 0) >= t.model
 }
 
-// Same order as the ccseats picker: lowest tier, then the tighter weekly figure, then 5h.
-function pickTarget({ list, thresholds }: Seats) {
+// Mirrors the ccseats picker: weekly headroom per day left until the weekly reset, measured to the
+// tighter of the week (or maxWeekly) and the model bucket.
+function roomPerDay(seat: Seat, t: Seats['thresholds'], now: number) {
+  const cap = seat.maxWeekly !== null && seat.maxWeekly < t.weekly ? seat.maxWeekly : t.weekly
+  const room = Math.min(cap - (seat.weekly ?? 0), t.model - (seat.model ?? 0))
+  const days = seat.resetWeekly === null ? 7 : (seat.resetWeekly - now) / 86400
+  return room / Math.max(days, 1 / 1440)
+}
+
+// Same order as the ccseats picker: most headroom per day, then 5h.
+function pickTarget({ list, thresholds }: Seats, now: number) {
   return list
     .filter(s => !s.isCurrent && !s.locked && s.session !== null && !overThreshold(s, thresholds))
     .filter(s => s.maxWeekly === null || (s.weekly ?? 0) < s.maxWeekly)
-    .sort(
-      (a, b) =>
-        a.tier - b.tier ||
-        Math.max(a.weekly ?? 0, a.model ?? 0) - Math.max(b.weekly ?? 0, b.model ?? 0) ||
-        (a.session ?? 0) - (b.session ?? 0),
-    )[0]
+    .sort((a, b) => roomPerDay(b, thresholds, now) - roomPerDay(a, thresholds, now) || (a.session ?? 0) - (b.session ?? 0))[0]
 }
 
 function usedColor(used: number) {
@@ -90,7 +94,7 @@ async function load($: EngineInterface) {
   const model: string = config.model ?? 'Fable'
   const now = (await $.clock.now()) / 1000
   const list: Seat[] = []
-  for (const [name, seat] of Object.entries<{ dir: string; tier?: number; maxWeekly?: number }>(config.seats)) {
+  for (const [name, seat] of Object.entries<{ dir: string; maxWeekly?: number }>(config.seats)) {
     const dir = expand(seat.dir)
     let cache: { limits?: Limit[]; five_hour?: { locked_reason: string | null }; seven_day?: { locked_reason: string | null } } = {}
     try {
@@ -103,7 +107,6 @@ async function load($: EngineInterface) {
     list.push({
       name,
       dir,
-      tier: seat.tier ?? 1,
       maxWeekly: seat.maxWeekly ?? null,
       session: session.used,
       weekly: weekly.used,
@@ -229,7 +232,7 @@ export const register: Register = on => {
     const { Box, Text, Button } = ui
     const state = await read($, seats)
     const now = (await $.clock.now()) / 1000
-    const target = pickTarget(state)
+    const target = pickTarget(state, now)
 
     const label = state.model.toLowerCase()
     const meter = (seat: Seat, name: string, used: number | null, reset: number | null) => (
@@ -255,7 +258,6 @@ export const register: Register = on => {
               <Text bold color={seat.isCurrent ? 'magenta' : undefined}>
                 {seat.isCurrent ? '●' : '○'} {seat.name}
               </Text>
-              <Text dimColor>tier {seat.tier}</Text>
               {seat.locked && <Text color="red">locked</Text>}
               {seat === target && <Text color="cyan">★</Text>}
               {seat.isCurrent && <Text dimColor>this session</Text>}
@@ -283,7 +285,7 @@ export const register: Register = on => {
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     const state = await read($, seats)
     const current = state.list.find(s => s.isCurrent)
-    const target = pickTarget(state)
+    const target = pickTarget(state, (await $.clock.now()) / 1000)
     const label = state.model.toLowerCase()
     if (!current || !overThreshold(current, state.thresholds) || (await read($, isDismissed))) return next(e)
     const { Box, Text, Button } = $.ui.resolve(e)
