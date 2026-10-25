@@ -274,7 +274,7 @@ cmd_remove() {
   fi
 }
 
-cmd_relink() { need_config; local n d; for n in $(seats); do d=$(seat_dir $n); [[ $d == $DEFAULT_DIR ]] || { link_shared $d; print "relinked $n" } done }
+cmd_relink() { need_config; local n d; for n in $(seats); do d=$(seat_dir $n); [[ $d == $DEFAULT_DIR ]] || { link_shared $d; sync_mcp $d; print "relinked $n" } done }
 
 cmd_chrome() {
   need_config; has_seat ${1:-} || die "usage: ccseats chrome <seat>"
@@ -340,9 +340,22 @@ cmd_pair() {
 
 # Claude Code prefers a token or API key from the environment over the stored login, which would
 # silently run every seat on the same account, so those are dropped.
+# MCP servers live in .claude.json beside the account, so the file cannot be linked: the default
+# seat's user and project registrations are merged in instead, the default winning a name clash.
+sync_mcp() {
+  local src=$HOME/.claude.json dst=$1/.claude.json tmp=$1/.claude.json.ccseats.$$
+  [[ -f $src && -f $dst ]] || return 0
+  jq --slurpfile d $src '
+    .mcpServers = ((.mcpServers // {}) + ($d[0].mcpServers // {}))
+    | .projects = reduce (($d[0].projects // {}) | to_entries[] | select((.value.mcpServers // {}) | length > 0)) as $p
+        (.projects // {}; .[$p.key].mcpServers = ((.[$p.key].mcpServers // {}) + $p.value.mcpServers))
+  ' $dst > $tmp && chmod 600 $tmp && mv $tmp $dst || rm -f $tmp
+}
+
 run_seat() {
   local dir=$(seat_dir $1)
   [[ -d $dir ]] || die "$dir does not exist. Run: ccseats relink"
+  [[ $dir == $DEFAULT_DIR ]] || sync_mcp $dir
   pin_device $1 $dir; shift
   if [[ $dir == $DEFAULT_DIR ]]; then exec env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY claude "$@"; fi
   exec env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR=$dir claude "$@"
