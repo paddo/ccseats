@@ -274,7 +274,7 @@ cmd_remove() {
   fi
 }
 
-cmd_relink() { need_config; local n d; for n in $(seats); do d=$(seat_dir $n); [[ $d == $DEFAULT_DIR ]] || { link_shared $d; print "relinked $n" } done }
+cmd_relink() { need_config; local n d; for n in $(seats); do d=$(seat_dir $n); [[ $d == $DEFAULT_DIR ]] || { link_shared $d; sync_mcp $d; print "relinked $n" } done }
 
 cmd_chrome() {
   need_config; has_seat ${1:-} || die "usage: ccseats chrome <seat>"
@@ -338,12 +338,28 @@ cmd_pair() {
   print "seat $name pinned to browser ${device:0:8}, shown as \"$name\""
 }
 
+# MCP servers live in .claude.json beside the account, so the file cannot be linked: the default
+# seat's user and project registrations are merged in instead, the default winning a name clash.
+# Only a change is written, which keeps the race with a live session's own writes to a real change.
+sync_mcp() {
+  local src=$(global_config $DEFAULT_DIR) dst=$(global_config $1) merge
+  [[ -f $src && -f $dst ]] || return 0
+  merge='
+    .mcpServers = ((.mcpServers // {}) + ($d[0].mcpServers // {}))
+    | .projects = reduce (($d[0].projects // {}) | to_entries[] | select((.value.mcpServers // {}) | length > 0)) as $p
+        (.projects // {}; .[$p.key].mcpServers = ((.[$p.key].mcpServers // {}) + $p.value.mcpServers))'
+  jq -e --slurpfile d $src "($merge) == ." $dst >/dev/null 2>&1 && return 0
+  jq --slurpfile d $src $merge $dst > $dst.tmp && chmod 600 $dst.tmp && mv $dst.tmp $dst || rm -f $dst.tmp
+}
+
 # Claude Code prefers a token or API key from the environment over the stored login, which would
 # silently run every seat on the same account, so those are dropped.
 run_seat() {
   local dir=$(seat_dir $1)
   [[ -d $dir ]] || die "$dir does not exist. Run: ccseats relink"
-  pin_device $1 $dir; shift
+  pin_device $1 $dir
+  [[ $dir == $DEFAULT_DIR ]] || sync_mcp $dir
+  shift
   if [[ $dir == $DEFAULT_DIR ]]; then exec env -u CLAUDE_CONFIG_DIR -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY claude "$@"; fi
   exec env -u CLAUDE_CODE_OAUTH_TOKEN -u ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR=$dir claude "$@"
 }
@@ -362,7 +378,7 @@ ccseats $VERSION - several Claude Code accounts side by side
   ccseats chrome <seat>                open the Chrome profile mapped to that seat
   ccseats pair <seat>                  pin the browser the seat is paired with now, labelled with the seat name
   ccseats statusline                   seat name and remaining budget, for a statusline script
-  ccseats relink                       recreate the shared symlinks in every seat
+  ccseats relink                       recreate the shared symlinks and copy MCP servers into every seat
 
 Config: $CONFIG
 EOF
