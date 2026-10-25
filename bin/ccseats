@@ -6,7 +6,7 @@
 emulate -L zsh
 setopt pipe_fail extended_glob
 
-VERSION=0.2.0
+VERSION=0.3.0
 CONFIG=${CCSEATS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ccseats/config.json}
 DEFAULT_DIR=$HOME/.claude
 USAGE_URL=https://api.anthropic.com/api/oauth/usage
