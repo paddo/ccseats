@@ -1,0 +1,29 @@
+name: Publish
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # Trusted publishing needs npm 11.5.1+, which Node 24 bundles.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+      - run: sudo apt-get install -y zsh && zsh -n bin/ccseats
+      - name: Publish a version npm does not have yet
+        run: |
+          version=$(node -p "require('./package.json').version")
+          if npm view "ccseats@$version" version >/dev/null 2>&1; then
+            echo "ccseats@$version is already on npm"
+          else
+            npm publish
+          fi
