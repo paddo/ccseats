@@ -72,7 +72,7 @@ It also copies your per-project trust and tool approvals into the new seat, so y
 
 **What stays per seat, and why:**
 
-- `.claude.json`: the signed-in account and the paired Chrome browser. It also holds MCP server registrations, so the file cannot be linked. Instead, each launch of a seat (and `ccseats relink`) merges the user and project MCP servers from `~/.claude.json` into the seat's file, `~/.claude.json` winning a name clash. Register a server once on the default seat and every seat gets it.
+- `.claude.json`: the signed-in account and the paired Chrome browser. It also holds MCP server registrations, so the file cannot be linked. Instead, each launch of a seat (and `ccseats relink`) merges the user and project MCP servers from `~/.claude.json` into the seat's file, `~/.claude.json` winning a name clash. Register a server once on the default seat and every seat gets it. Removing a server does not carry over: remove it from each seat with `CLAUDE_CONFIG_DIR=~/.claude-<seat> claude mcp remove <name>`.
 - `history.jsonl`: Claude Code refuses a symlinked or hard-linked history file, so prompt history is per seat.
 - `sessions`, `session-env`, security state, telemetry, caches: per process or per account.
 
