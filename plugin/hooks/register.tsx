@@ -101,7 +101,9 @@ async function load($: EngineInterface) {
       cache = JSON.parse(await $.fs.read(`${dir}/usage-cache.json`))
     } catch {}
     const limits = cache.limits ?? []
-    const session = usage(limits.find(l => l.kind === 'session'), now)
+    // The API omits the session limit when no 5h window is open, which means 0.
+    const sessionLimit = limits.find(l => l.kind === 'session')
+    const session = !sessionLimit && cache.limits ? { used: 0, reset: null } : usage(sessionLimit, now)
     const weekly = usage(limits.find(l => l.kind === 'weekly_all'), now)
     const scoped = usage(limits.find(l => l.kind === 'weekly_scoped' && l.scope?.model?.display_name === model), now)
     list.push({

@@ -6,7 +6,7 @@
 emulate -L zsh
 setopt pipe_fail extended_glob
 
-VERSION=0.3.0
+VERSION=0.3.1
 CONFIG=${CCSEATS_CONFIG:-${XDG_CONFIG_HOME:-$HOME/.config}/ccseats/config.json}
 DEFAULT_DIR=$HOME/.claude
 USAGE_URL=https://api.anthropic.com/api/oauth/usage
@@ -108,7 +108,8 @@ live_sessions() {
 SEP=$'\x1f'
 # session weekly model resetSession resetWeekly, split by the ASCII unit separator so empty fields
 # survive `read`. An idle seat cannot use more quota, so a cached value stays a safe upper bound,
-# and a window whose reset time has passed counts as empty.
+# and a window whose reset time has passed counts as empty. The API omits the session limit when no
+# 5h window is open, which also means 0.
 usage_fields() {
   jq -r --arg m "$(cfg '.model // "Fable"')" --argjson now $(date +%s) '
     def epoch: if . == null then null else (sub("\\.[0-9]+"; "") | sub("\\+00:00$"; "Z") | fromdateiso8601) end;
@@ -117,7 +118,7 @@ usage_fields() {
     def reset: if . == null then "" else ((.resets_at | epoch) as $e | if $e == null or $e < $now then "" else $e end) end;
     lim(.kind == "session") as $s | lim(.kind == "weekly_all") as $w
     | lim(.kind == "weekly_scoped" and .scope.model.display_name == $m) as $x
-    | [($s | used), ($w | used), ($x | used), ($s | reset), ($w | reset)] | map(tostring) | join("\u001f")' $1
+    | [(if $s == null then 0 else ($s | used) end), ($w | used), ($x | used), ($s | reset), ($w | reset)] | map(tostring) | join("\u001f")' $1
 }
 
 # One line per seat: name email session weekly model resetSession resetWeekly live maxWeekly note
